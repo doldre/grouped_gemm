@@ -1,5 +1,6 @@
 from grouped_gemm import backend
 import torch
+import threading
 import warnings
 
 from sys import stderr
@@ -51,9 +52,12 @@ def sinkhorn_kernel(cost, tol=0.0001):
 
 class PermuteMoE_topK(torch.autograd.Function):
 
-  workspace_fw=None
-  dtype=None
-  max_expanded_token_num=0
+  device_cache = {}
+  _cache_lock = threading.RLock()  # 添加线程锁
+#   workspace_fw=None
+#   dtype=None
+#   max_expanded_token_num=0
+
 
   @staticmethod
   def forward(ctx, 
@@ -105,21 +109,42 @@ class PermuteMoE_topK(torch.autograd.Function):
 
     num_topK = indices.size(1)
 
-    input_max_expanded_token_num = max(max_token_num, input_act.size(0)) * num_topK
-    if PermuteMoE_topK.max_expanded_token_num < input_max_expanded_token_num:
-      PermuteMoE_topK.max_expanded_token_num = input_max_expanded_token_num
-      PermuteMoE_topK.workspace_fw = []
+    # 线程安全的设备缓存访问
+    with PermuteMoE_topK._cache_lock:
+      if input_act.device not in PermuteMoE_topK.device_cache:
+        PermuteMoE_topK.device_cache[input_act.device] = {
+          'max_expanded_token_num': 0,
+          'dtype': input_act.dtype,
+          'workspace_fw': []
+        }
+      
+      input_max_expanded_token_num = max(max_token_num, input_act.size(0)) * num_topK
+      
+      if PermuteMoE_topK.device_cache[input_act.device]['max_expanded_token_num'] < input_max_expanded_token_num:
+        PermuteMoE_topK.device_cache[input_act.device]['max_expanded_token_num'] = input_max_expanded_token_num
+        PermuteMoE_topK.device_cache[input_act.device]['workspace_fw'] = []
 
-    if PermuteMoE_topK.dtype != input_act.dtype:
-      PermuteMoE_topK.dtype = input_act.dtype
-      PermuteMoE_topK.workspace_fw = []
+      if PermuteMoE_topK.device_cache[input_act.device]['dtype'] != input_act.dtype:
+        PermuteMoE_topK.device_cache[input_act.device]['dtype'] = input_act.dtype
+        PermuteMoE_topK.device_cache[input_act.device]['workspace_fw'] = []
 
-    permuted_act, row_id_map, PermuteMoE_topK.workspace_fw = backend.permute(
-      input_act,
-      indices,
-      num_out_tokens,
-      PermuteMoE_topK.workspace_fw,
-      PermuteMoE_topK.max_expanded_token_num)
+      max_expanded_token_num = PermuteMoE_topK.device_cache[input_act.device]['max_expanded_token_num']
+      workspace_fw = PermuteMoE_topK.device_cache[input_act.device]['workspace_fw'].copy()  # 创建副本
+    # print('input_act.device', input_act.device)
+    # print(input_act.device, 'workspace_fw', workspace_fw)
+
+    # 确保在正确的设备上下文中执行
+    with torch.cuda.device(input_act.device):
+      permuted_act, row_id_map, workspace_fw = backend.permute(
+        input_act,
+        indices,
+        num_out_tokens,
+        workspace_fw,
+        max_expanded_token_num)
+    
+    # 线程安全地更新workspace
+    with PermuteMoE_topK._cache_lock:
+      PermuteMoE_topK.device_cache[input_act.device]['workspace_fw'] = workspace_fw
 
     ctx.row_id_map = row_id_map
     ctx.num_tokens = indices.size(0)

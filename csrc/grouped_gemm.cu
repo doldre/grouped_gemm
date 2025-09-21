@@ -1,5 +1,7 @@
 #include "grouped_gemm.h"
 
+#include <unordered_map>
+#include <mutex>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/BFloat16.h>
 #include <c10/cuda/CUDAStream.h>
@@ -188,44 +190,79 @@ torch::Tensor CutlassGroupedGemm(torch::Tensor a,
   return c;
 }
 
-cublasHandle_t cublas_handle[NUM_STREAM];
-cudaStream_t cublas_stream[NUM_STREAM];
-cudaEvent_t cublas_event[NUM_STREAM];
-bool cublas_init = false;
+// 每个设备的CuBLAS上下文
+struct DeviceCublasContext {
+    cublasHandle_t cublas_handle[NUM_STREAM];
+    cudaStream_t cublas_stream[NUM_STREAM];
+    cudaEvent_t cublas_event[NUM_STREAM];
+    bool initialized = false;
+    std::mutex init_mutex;  // 每个设备独立的初始化锁
+};
 
-void cublas_handle_init()
-{
-    cublas_init = true;
+// 设备ID -> CuBLAS上下文的映射
+static std::unordered_map<int, std::unique_ptr<DeviceCublasContext>> device_contexts;
+static std::mutex device_contexts_mutex;  // 保护设备上下文映射的全局锁
 
-    for (int i = 0; i < NUM_STREAM; i++)
+// 获取当前设备的CuBLAS上下文，如果不存在则创建
+DeviceCublasContext* get_device_cublas_context() {
+    int device_id;
+    cudaGetDevice(&device_id);
+    
+    // 双重检查锁定模式确保线程安全
     {
-        cudaStreamCreateWithFlags(&cublas_stream[i], cudaStreamNonBlocking);
-        cublasCreate(&cublas_handle[i]);
-        cublasSetStream(cublas_handle[i], cublas_stream[i]);
-        cudaEventCreate(&cublas_event[i]);
+        std::lock_guard<std::mutex> global_lock(device_contexts_mutex);
+        
+        // 检查设备上下文是否存在
+        auto it = device_contexts.find(device_id);
+        if (it == device_contexts.end()) {
+            // 创建新的设备上下文
+            device_contexts[device_id] = std::make_unique<DeviceCublasContext>();
+        }
     }
+    
+    DeviceCublasContext* ctx = device_contexts[device_id].get();
+    
+    // 使用设备特定的锁进行初始化
+    std::lock_guard<std::mutex> init_lock(ctx->init_mutex);
+    
+    if (!ctx->initialized) {
+        // 确保在正确的设备上初始化
+        cudaSetDevice(device_id);
+        
+        for (int i = 0; i < NUM_STREAM; i++) {
+            cudaStreamCreateWithFlags(&ctx->cublas_stream[i], cudaStreamNonBlocking);
+            cublasCreate(&ctx->cublas_handle[i]);
+            cublasSetStream(ctx->cublas_handle[i], ctx->cublas_stream[i]);
+            cudaEventCreate(&ctx->cublas_event[i]);
+        }
+        ctx->initialized = true;
+    }
+    
+    return ctx;
 }
 
 inline void cublas_current_wait_streams(cudaStream_t stream)
 {
+    DeviceCublasContext* ctx = get_device_cublas_context();
     for (int s = 0; s < NUM_STREAM; s++)
     {
-        cudaEventRecord(cublas_event[s], cublas_stream[s]);
+        cudaEventRecord(ctx->cublas_event[s], ctx->cublas_stream[s]);
     }
 
     for (int s = 0; s < NUM_STREAM; s++)
     {
-        cudaStreamWaitEvent(stream, cublas_event[s]);
+        cudaStreamWaitEvent(stream, ctx->cublas_event[s]);
     }
 }
 
 inline void cublas_streams_wait_current(cudaStream_t stream)
 {
-    cudaEventRecord(cublas_event[0], stream);
+    DeviceCublasContext* ctx = get_device_cublas_context();
+    cudaEventRecord(ctx->cublas_event[0], stream);
 
     for (int s = 0; s < NUM_STREAM; s++)
     {
-        cudaStreamWaitEvent(cublas_stream[s], cublas_event[0]);
+        cudaStreamWaitEvent(ctx->cublas_stream[s], ctx->cublas_event[0]);
     }
 }
 
@@ -259,8 +296,8 @@ void CublasGroupedGemm(torch::Tensor a,
 		       torch::Tensor c,
 		       torch::Tensor batch_sizes,
 		       bool trans_b) {
-  if (!cublas_init)
-    cublas_handle_init();
+  // 获取当前设备的CuBLAS上下文（自动初始化）
+  DeviceCublasContext* ctx = get_device_cublas_context();
 
   int64_t bs = batch_sizes.size(0), k = a.size(1);
   int64_t n = trans_b ? b.size(1) : b.size(2);
@@ -274,7 +311,8 @@ void CublasGroupedGemm(torch::Tensor a,
   for (int i = 0; i < bs; ++i) {
 
     int64_t m = batch_sizes.data_ptr<int64_t>()[i];
-    CublasGemm(cublas_handle[i % NUM_STREAM], a_ptr, m, k, /*trans_a=*/false,
+    // 使用设备特定的CuBLAS句柄
+    CublasGemm(ctx->cublas_handle[i % NUM_STREAM], a_ptr, m, k, /*trans_a=*/false,
 	       b_ptr, b_rows, b_cols, trans_b,
 	       c_ptr, m, n);
     a_ptr += m * k;
@@ -289,8 +327,8 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
 				torch::Tensor b,
 				torch::Tensor c,
 				torch::Tensor batch_sizes) {
-  if (!cublas_init)
-    cublas_handle_init();
+  // 获取当前设备的CuBLAS上下文（自动初始化）
+  DeviceCublasContext* ctx = get_device_cublas_context();
 
   int64_t bs = batch_sizes.size(0), m = a.size(1), n = b.size(1);
   c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
@@ -301,7 +339,8 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
 
   for (int i = 0; i < bs; ++i) {
     int64_t k = batch_sizes.data_ptr<int64_t>()[i];
-    CublasGemm(cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/true,
+    // 使用设备特定的CuBLAS句柄
+    CublasGemm(ctx->cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/true,
 	       b_ptr, k, n, /*trans_b=*/false,
 	       c_ptr, m, n);
     a_ptr += k * m;
